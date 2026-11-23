@@ -1281,7 +1281,11 @@ export function apply(ctx, config, deps = {}) {
    * `holdNote`).
    * @returns {{message: object, mode: string, skipped: boolean, dropped?: true, held?: true}}
    */
-  async function sendTo(agent, { content: blocks, source, mode = 'followup', key }) {
+  function requireInboundPermission(authorized) {
+    if (authorized && !authorized()) throw new Error('Telegram sticker authorization expired');
+  }
+
+  async function sendTo(agent, { content: blocks, source, mode = 'followup', key, authorized }) {
     // Providers that take a message as one string join its blocks with nothing in between:
     // a header block ends its line itself, so the text under it starts on a new one.
     const content = blocks.map((b, i) => (i < blocks.length - 1 && b?.type === 'text' && !b.text.endsWith('\n') ? { ...b, text: `${b.text}\n` } : b));
@@ -1289,6 +1293,7 @@ export function apply(ctx, config, deps = {}) {
     // A note that must not wake anyone is dropped where Harness cannot inject: it is "good to know", never worth a turn.
     if (mode === 'inject' && typeof agent.inject !== 'function') return { message, mode, skipped: true, dropped: true };
     if (key) await loadHistory(agent.session?.id);
+    requireInboundPermission(authorized);
     if (key && holds(agent, message.id)) return { message, mode, skipped: true };
     const how = mode === 'inject' ? 'inject' : mode !== 'followup' && typeof agent.steer === 'function' ? 'steer' : 'followup';
     if (how === 'inject' && agent.status === 'running') {
@@ -1569,7 +1574,8 @@ export function apply(ctx, config, deps = {}) {
    * One image the person attached in the panel, stored by Harness's attachment store (which checks
    * the bytes against the type, normalizes the image and keeps it): its reference. Base64 bytes.
    */
-  async function admitImage({ mediaType, data, name } = {}) {
+  async function admitImage({ mediaType, data, name } = {}, authorized) {
+    requireInboundPermission(authorized);
     const att = attachmentStore();
     if (typeof att?.admitPromptContent !== 'function') throw new Error('sending images needs a Harness with attachments (the Web profile)');
     const type = String(mediaType ?? '').toLowerCase();
@@ -1578,6 +1584,8 @@ export function apply(ctx, config, deps = {}) {
     if (!b64) throw new Error('the image is empty');
     const label = String(name ?? '').split(/[\\/]/).pop().trim().slice(0, 200);
     const [part] = await att.admitPromptContent([{ type: 'image', mediaType: type, data: b64, ...(label ? { name: label } : {}) }]);
+    // The Host may already have admitted bytes; do not retain the reference in Bots after revocation.
+    requireInboundPermission(authorized);
     const [ref] = images.remember([part?.attachment]);
     if (!ref) throw new Error('the image was not stored');
     return ref;
@@ -1654,7 +1662,7 @@ export function apply(ctx, config, deps = {}) {
    * dispatcher hears of it without waking. Returns `{sessionId, message?}`, or null when the task did
    * not take it (the dispatcher does then).
    */
-  async function cardFollowUp(bot, body, { need, ticket }, { key, chat = null, messageKey = '', images: refs = [] } = {}) {
+  async function cardFollowUp(bot, body, { need, ticket }, { key, chat = null, messageKey = '', images: refs = [], authorized } = {}) {
     const id = chat ? '' : newPanelId();
     if (!chat) store.log({ id, from: 'user', to: ticket.botId, chat: bot.id, kind: 'user', text: body, thread: key, ticket: ticket.id, need: need.id, ...imageIdsOf(refs) });
     let next;
@@ -1662,6 +1670,7 @@ export function apply(ctx, config, deps = {}) {
       next = await appendToTicket(tickets.get(ticket.id) ?? ticket, body, {
         human: true,
         images: refs,
+        authorized,
         ...(chat ? { chat, header: chat.header, ...(chat.context ? { context: chat.context } : {}) } : { logged: true }),
         key: chat ? (messageKey ? `${messageKey}:${ticket.id}` : '') : `panel:${id}:${ticket.id}`,
       });
@@ -1678,7 +1687,7 @@ export function apply(ctx, config, deps = {}) {
     try {
       const agent = await agentOf(bot);
       const text = followUpNoticeText({ tickets: [next], thread: key, who: chat?.who ?? 'The user', text: body }, cardCtx());
-      await sendTo(agent, { content: [{ type: 'text', text }], source: { kind: 'agent-message', form: 'relay' }, mode: 'inject', key: `followup:${messageKey || id || randomUUID()}` });
+      await sendTo(agent, { content: [{ type: 'text', text }], source: { kind: 'agent-message', form: 'relay' }, mode: 'inject', key: `followup:${messageKey || id || randomUUID()}`, authorized });
     } catch (error) {
       ctx.logger?.warn?.(`bots: the follow-up notice for @${bot.handle}: ${error?.message ?? error}`);
     }
@@ -2547,14 +2556,22 @@ export function apply(ctx, config, deps = {}) {
    * (`parked`, kept in tickets.json, so it outlasts a restart) for the pump to deliver in order when a
    * slot frees. Messages already parked go first. Returns `{parked}`.
    */
-  async function toTicket(t, { content, source, key, human = false }) {
+  async function toTicket(t, { content, source, key, human = false, authorized }) {
+    requireInboundPermission(authorized);
     const waiting = parkedOf(tickets.get(t.id) ?? t);
     if (waiting.some((m) => m.key === key)) return { parked: true };
+    const alreadyHeld = slots.holds(t.id);
     if (waiting.length === 0 && slots.acquire(t.id, { human })) {
-      const agent = await ticketAgent(t);
-      await sendTo(agent, { content, source, mode: 'steer', key });
+      try {
+        const agent = await ticketAgent(t);
+        await sendTo(agent, { content, source, mode: 'steer', key, authorized });
+      } catch (error) {
+        if (authorized && !authorized() && !alreadyHeld && slots.release(t.id)) void pump();
+        throw error;
+      }
       return { parked: false };
     }
+    // Parking is the synchronous admission point when no worker slot is available.
     tickets.patch(t.id, { parked: [...waiting, { key, content, source, at: nowMs(), ...(human ? { human: true } : {}) }] });
     void pump();
     return { parked: true };
@@ -2699,7 +2716,7 @@ export function apply(ctx, config, deps = {}) {
    * take the extra one); until then it waits on the ticket. A message whose `key` was delivered (or
    * parked) already changes nothing: a replay after a restart neither reopens nor wakes the ticket.
    */
-  async function appendToTicket(t, text, { sender = null, senderSessionId = '', human = false, force = false, header = '', context = '', chat = null, key = '', logged = false, images: refs = [] } = {}) {
+  async function appendToTicket(t, text, { sender = null, senderSessionId = '', human = false, force = false, header = '', context = '', chat = null, key = '', logged = false, images: refs = [], authorized } = {}) {
     const body = String(text ?? '').trim();
     if (body === '' && !refs.length) throw new Error('text must not be empty');
     if (t.archivedAt) throw new Error(`task ${t.id} is archived; open a new task instead`);
@@ -2708,6 +2725,7 @@ export function apply(ctx, config, deps = {}) {
       const live = agents()?.get?.(t.sessionId) ?? { session: { id: t.sessionId } };
       if (holds(live, `${MESSAGE_PREFIX}${key}`) || parkedOf(tickets.get(t.id) ?? t).some((m) => m.key === key)) return tickets.get(t.id) ?? t;
     }
+    requireInboundPermission(authorized);
     if (sender && t.botId !== sender.id) {
       const target = store.get(t.botId);
       if (target && !admitPair(sender.id, target.id)) throw pairRefusal(sender, target);
@@ -2755,7 +2773,7 @@ export function apply(ctx, config, deps = {}) {
       ...imageBlocks(refs),
     ];
     // A person's follow-up may take the extra slot (new work cannot crowd it out); a bot's may not.
-    await toTicket(cur, { content, source: sender && senderSessionId ? { kind: 'agent-message', form: 'relay', senderSessionId } : { kind: 'user' }, key: key || `msg:${cur.id}:${randomUUID()}`, human: human && !sender });
+    await toTicket(cur, { content, source: sender && senderSessionId ? { kind: 'agent-message', form: 'relay', senderSessionId } : { kind: 'user' }, key: key || `msg:${cur.id}:${randomUUID()}`, human: human && !sender, authorized });
     // A panel message is in the timeline already (logged when it was sent).
     if (logged) return tickets.get(cur.id) ?? cur;
     store.log(
@@ -3226,7 +3244,7 @@ export function apply(ctx, config, deps = {}) {
    * extra slot), and the Router (the channel owner's home) is told without being woken. That notice
    * is no input of its turn: its replies do not go to that Thread because of it.
    */
-  async function followUp(list, { header, body, context = '' }, { threadKey: key, origin, owner, key: messageKey }) {
+  async function followUp(list, { header, body, context = '', refs = [] }, { threadKey: key, origin, owner, key: messageKey, authorized }) {
     const router = owner ? store.get(owner.id) : null;
     // A message handed out again after a restart that the Router already took (it opened these very
     // tickets) is no follow-up: it is not run twice.
@@ -3240,7 +3258,7 @@ export function apply(ctx, config, deps = {}) {
     for (const t of list) {
       const cur = tickets.get(t.id) ?? t;
       try {
-        const next = await appendToTicket(cur, body, { human: true, header: `${header}${threadNote(key)}`, context, chat: { kind: origin?.kind, who: origin?.who, threadKey: key }, ...(messageKey ? { key: `${messageKey}:${cur.id}` } : {}) });
+        const next = await appendToTicket(cur, body, { human: true, header: `${header}${threadNote(key)}`, context, images: refs, authorized, chat: { kind: origin?.kind, who: origin?.who, threadKey: key }, ...(messageKey ? { key: `${messageKey}:${cur.id}` } : {}) });
         reached.push(next);
         if (next.sessionId) sessions.push(next.sessionId);
       } catch (error) {
@@ -3255,7 +3273,7 @@ export function apply(ctx, config, deps = {}) {
         if (found?.agent) {
           // The Thread's label names the chat app already ("Telegram · Kada"), so no `via` beside it.
           const text = followUpNoticeText({ tickets: reached, thread: key, who: origin?.who, ...(tickets.thread(key)?.label ? {} : { via: CHANNEL_LABELS[origin?.kind] ?? origin?.kind }), text: body }, cardCtx());
-          await sendTo(found.agent, { content: [{ type: 'text', text }], source: { kind: 'agent-message', form: 'relay' }, mode: 'inject', key: `followup:${messageKey ?? randomUUID()}` });
+          await sendTo(found.agent, { content: [{ type: 'text', text }], source: { kind: 'agent-message', form: 'relay' }, mode: 'inject', key: `followup:${messageKey ?? randomUUID()}`, authorized });
         }
       } catch (error) {
         ctx.logger?.warn?.(`bots: the follow-up notice for @${router.handle}: ${error?.message ?? error}`);
@@ -3288,10 +3306,13 @@ export function apply(ctx, config, deps = {}) {
     file: join(dir, 'channels.json'),
     bots: () => store.list(),
     entries: () => templates(),
+    admitSticker: admitImage,
+    reviewedStickerAnnotations: new Map(Object.entries(cfg.telegramStickerAnnotations ?? {}).filter(([hash]) => /^[a-f0-9]{64}$/.test(hash))),
     // A chat message is a user prompt like one typed in the panel, after a line naming where it came from
     // and its Thread (so the bot can name it in bot_reply). Its id comes from the chat message's, so a
     // message handed out again after a restart is not run twice.
-    deliver: async (target, { header, body, context = '' }, meta = {}) => {
+    deliver: async (target, { header, body, context = '', refs = [] }, meta = {}) => {
+      requireInboundPermission(meta.authorized);
       // A reply in a chat Thread the bot spoke in before: its discussion (Bots 0.10).
       let into = null;
       try {
@@ -3299,6 +3320,7 @@ export function apply(ctx, config, deps = {}) {
       } catch (error) {
         ctx.logger?.warn?.(`bots: a chat thread could not get its own conversation (${error?.message ?? error}); @${target.handle} takes it`);
       }
+      requireInboundPermission(meta.authorized);
       if (into) {
         // The thread's first message carries the note, claimed before the hand-over (two may arrive at once).
         const first = !discussions.get(into.discussion.key)?.noted;
@@ -3310,9 +3332,11 @@ export function apply(ctx, config, deps = {}) {
             { type: 'text', text: `${note}${header}${threadNote(meta.threadKey)}` },
             { type: 'text', text: body },
             ...(context ? [{ type: 'text', text: context }] : []),
+            ...imageBlocks(refs),
           ],
           source: { kind: 'user' },
           mode: homeMode(target),
+          authorized: meta.authorized,
           ...(meta.key ? { key: meta.key } : {}),
         });
         discussions.patch(into.discussion.key, { lastAt: nowMs() });
@@ -3331,9 +3355,11 @@ export function apply(ctx, config, deps = {}) {
           { type: 'text', text: body },
           // The chat context the chat app read with it (what it replies to, its topic, a forward).
           ...(context ? [{ type: 'text', text: context }] : []),
+          ...imageBlocks(refs),
         ],
         source: { kind: 'user' },
         mode: homeMode(target),
+        authorized: meta.authorized,
         ...(meta.key ? { key: meta.key } : {}),
       });
       // Handed out: no longer in To do; its dispatcher is the bot that took it.
@@ -3342,7 +3368,7 @@ export function apply(ctx, config, deps = {}) {
     },
     // A new GitHub issue with the label, filed on the board (Bots 0.14).
     fileIssue: (owner, issue, at) => fileIssue(owner, issue, at),
-    toTickets: (list, msg, meta) => (meta?.card ? cardFollowUp(meta.owner, msg.body, meta.card, { key: meta.threadKey, chat: { kind: meta.origin?.kind, who: meta.origin?.who, threadKey: meta.threadKey, header: `${msg.header}${threadNote(meta.threadKey)}`, ...(msg.context ? { context: msg.context } : {}) }, messageKey: meta.key ?? '' }).then((r) => (r ? [r.sessionId] : Promise.reject(new Error('the task did not take it')))) : followUp(list, msg, meta)),
+    toTickets: (list, msg, meta) => (meta?.card ? cardFollowUp(meta.owner, msg.body, meta.card, { key: meta.threadKey, chat: { kind: meta.origin?.kind, who: meta.origin?.who, threadKey: meta.threadKey, header: `${msg.header}${threadNote(meta.threadKey)}`, ...(msg.context ? { context: msg.context } : {}) }, messageKey: meta.key ?? '', images: msg.refs, authorized: meta.authorized }).then((r) => (r ? [r.sessionId] : Promise.reject(new Error('the task did not take it')))) : followUp(list, msg, meta)),
     // A chat message to the dispatcher that starts with a card's reference: that card's one live task (Bots 0.13).
     cardRoute: (owner, text) => (isRouter(store.get(owner?.id)) ? leadingCard(text) : null),
     subscribers: (key) => tickets.subscribers(key),
